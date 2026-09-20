@@ -2174,7 +2174,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             }
 
             Request::Installed(dist) => {
-                let metadata = provider.get_installed_metadata(&dist).boxed_local().await?;
+                let metadata = provider
+                    .get_installed_metadata(&dist, self.env.marker_environment())
+                    .boxed_local()
+                    .await?;
 
                 if let MetadataResponse::Found(metadata) = &metadata {
                     if &metadata.metadata.name != dist.name() {
@@ -2341,8 +2344,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                             }
                         }
                         ResolvedDist::Installed { dist } => {
-                            let metadata =
-                                provider.get_installed_metadata(&dist).boxed_local().await?;
+                            let metadata = provider
+                                .get_installed_metadata(&dist, self.env.marker_environment())
+                                .boxed_local()
+                                .await?;
 
                             Response::Installed {
                                 dist: (*dist).clone(),
