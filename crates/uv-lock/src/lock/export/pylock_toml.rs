@@ -480,7 +480,7 @@ impl<'lock> PylockToml {
         // Convert each node to a `pylock.toml`-style package.
         let mut packages = Vec::with_capacity(resolution.graph.node_count());
         for (node_index, node) in resolution.base_dists() {
-            let ResolvedDist::Installable { dist, version } = &node.dist else {
+            let ResolvedDist::Installable { dist, version, .. } = &node.dist else {
                 continue;
             };
             if omit.contains(dist.name()) {
@@ -1340,6 +1340,7 @@ impl<'lock> PylockToml {
                 }));
                 let dist = ResolvedDist::Installable {
                     dist: Arc::new(built_dist),
+                    variants_json: None,
                     version: package.version,
                 };
                 Node::Dist {
@@ -1357,6 +1358,7 @@ impl<'lock> PylockToml {
                 )?));
                 let dist = ResolvedDist::Installable {
                     dist: Arc::new(sdist),
+                    variants_json: None,
                     version: package.version,
                 };
                 Node::Dist {
@@ -1371,6 +1373,7 @@ impl<'lock> PylockToml {
                 ));
                 let dist = ResolvedDist::Installable {
                     dist: Arc::new(sdist),
+                    variants_json: None,
                     version: package.version,
                 };
                 Node::Dist {
@@ -1385,6 +1388,7 @@ impl<'lock> PylockToml {
                 ));
                 let dist = ResolvedDist::Installable {
                     dist: Arc::new(sdist),
+                    variants_json: None,
                     version: package.version,
                 };
                 Node::Dist {
@@ -1401,6 +1405,7 @@ impl<'lock> PylockToml {
                 let dist = dist.to_dist(install_path, &package.name, package.version.as_ref())?;
                 let dist = ResolvedDist::Installable {
                     dist: Arc::new(dist),
+                    variants_json: None,
                     version: package.version,
                 };
                 Node::Dist {
