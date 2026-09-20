@@ -3952,6 +3952,7 @@ fn preview_features() {
     +            MinimumLibcVersion,
     +            BuildDependencyCheck,
     +            BuildLazyImports,
+    +            WheelVariants,
     +        ],
          },
          python_preference: Managed,
