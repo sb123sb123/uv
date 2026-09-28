@@ -11916,6 +11916,15 @@ fn frozen_lockfile_metadata_free_default_groups() -> Result<()> {
     dep v1.0.0
     ");
 
+    uv_snapshot!(context.filters(), context.sync()
+        .args(["--frozen", "--offline", "--dry-run", "--no-install-workspace", "--preview-features", "frozen-lockfile"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Would use project environment at: .venv
+    Checked in [TIME]
+    Would make no changes
+    ");
+
     Ok(())
 }
 
@@ -12627,6 +12636,23 @@ fn frozen_lockfile_non_project_workspace() -> Result<()> {
     exit_code: 2 (failure)
     ----- stderr -----
     error: The lockfile does not record default dependency groups for a non-project workspace root; pass `--no-default-groups`, `--only-group`, `--only-dev`, or `--all-groups`
+    ");
+
+    uv_snapshot!(context.filters(), context.sync()
+        .args(["--frozen", "--offline", "--dry-run", "--preview-features", "frozen-lockfile"]), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: The lockfile does not record default dependency groups for a non-project workspace root; pass `--no-default-groups`, `--only-group`, `--only-dev`, or `--all-groups`
+    ");
+
+    uv_snapshot!(context.filters(), context.sync()
+        .args(["--frozen", "--offline", "--dry-run", "--package", "member", "--preview-features", "frozen-lockfile"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Would use project environment at: .venv
+    Would download 1 package
+    Would install 1 package
+     + member @ file://[TEMP_DIR]/member
     ");
 
     // A selected member has its own recorded defaults.
