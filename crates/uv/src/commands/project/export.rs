@@ -29,9 +29,10 @@ use uv_warnings::warn_user;
 use uv_workspace::{DiscoveryOptions, MemberDiscovery, VirtualProject, WorkspaceCache};
 
 use crate::commands::pip::loggers::DefaultResolveLogger;
-use crate::commands::project::install_target::InstallTarget;
+use crate::commands::project::install_target::{InstallTarget, PackageSelection};
 use crate::commands::project::lock::{LockMode, LockOperation};
 use crate::commands::project::lock_target::LockTarget;
+use crate::commands::project::lockfile::FrozenWorkspace;
 use crate::commands::project::{
     ProjectEnvironmentPolicy, ProjectInterpreter, ScriptInterpreter, UniversalState,
     WorkspacePython, detect_conflicts,
@@ -51,12 +52,22 @@ enum ExportTarget {
 }
 
 impl<'lock> From<&'lock ExportTarget> for LockTarget<'lock> {
-    fn from(value: &'lock ExportTarget) -> Self {
-        match value {
+    fn from(target: &'lock ExportTarget) -> Self {
+        match target {
             ExportTarget::Script(script) => Self::Script(script),
             ExportTarget::Project(project) => Self::Workspace(project.workspace()),
         }
     }
+}
+
+/// An export reads an existing workspace lock or resolves a project or script manifest.
+#[derive(Debug)]
+enum ExportSource<'a> {
+    Manifest(&'a ExportTarget),
+    Lockfile {
+        workspace: &'a FrozenWorkspace,
+        project_name: Option<PackageName>,
+    },
 }
 
 /// Independent selections and destinations for a batch export.
@@ -127,6 +138,20 @@ impl ExportBatch {
     }
 }
 
+/// Resolve export groups, preferring the defaults of a single selected package.
+fn resolve_lockfile_groups(
+    groups: &DependencyGroups,
+    workspace: &FrozenWorkspace,
+    project: Option<&PackageName>,
+    packages: &[PackageName],
+) -> Result<DependencyGroupsWithDefaults> {
+    let project = match packages {
+        [name] => Some(name),
+        _ => project,
+    };
+    workspace.resolve_groups(groups, project)
+}
+
 /// Export the project's `uv.lock` in an alternate format.
 #[expect(clippy::fn_params_excessive_bools)]
 pub(crate) async fn export(
@@ -175,9 +200,30 @@ pub(crate) async fn export(
         None
     };
 
+    // Frozen exports can use a lockfile when the workspace manifest is missing. Index and find-links
+    // emission still requires the manifest because the lockfile does not record that configuration.
+    let locked_data = if frozen.is_some() && script.is_none() {
+        FrozenWorkspace::discover(project_dir, preview).await?
+    } else {
+        None
+    };
+    if locked_data.is_some() && (include_index_url || include_find_links) {
+        bail!(
+            "`--emit-index-url` and `--emit-find-links` are not supported without a workspace manifest"
+        );
+    }
+
     // Identify the target.
-    let target = if let Some(script) = script {
-        ExportTarget::Script(script)
+    let manifest_target;
+    let source = if let Some(workspace) = &locked_data {
+        let project_name = workspace.current_project(project_dir).cloned();
+        ExportSource::Lockfile {
+            workspace,
+            project_name,
+        }
+    } else if let Some(script) = script {
+        manifest_target = ExportTarget::Script(script);
+        ExportSource::Manifest(&manifest_target)
     } else {
         let project = if frozen.is_some() {
             let options = DiscoveryOptions {
@@ -230,112 +276,115 @@ pub(crate) async fn export(
 
             project
         };
-        ExportTarget::Project(project)
+        manifest_target = ExportTarget::Project(project);
+        ExportSource::Manifest(&manifest_target)
     };
 
-    // Find an interpreter for the project, unless `--frozen` is set.
-    let interpreter = if frozen.is_some() {
-        None
-    } else {
-        Some(match &target {
-            ExportTarget::Script(script) => ScriptInterpreter::discover(
-                script.into(),
-                python.as_deref().map(PythonRequest::parse),
-                &client_builder,
-                python_preference,
-                python_downloads,
-                &install_mirrors,
-                false,
-                config_discovery,
-                ActiveEnvironment::Ignore,
-                cache,
-                printer,
-            )
-            .await?
-            .into_interpreter(),
-            ExportTarget::Project(project) => {
-                // Selected groups can impose additional Python requirements on a single export.
-                // Batch entries may have incompatible group requirements, so choose the interpreter
-                // for locking using only workspace requirements, as `uv lock` does. Each output's
-                // groups and project defaults are applied separately when rendering below.
-                let interpreter_groups = if batch.is_some() {
-                    DependencyGroupsWithDefaults::none()
-                } else {
-                    groups.with_defaults(project.default_groups()?)
-                };
-                let workspace_python = WorkspacePython::from_request(
-                    python.as_deref().map(PythonRequest::parse),
-                    Some(project.workspace()),
-                    &interpreter_groups,
-                    project_dir,
-                    config_discovery,
-                )
-                .await?;
-                ProjectInterpreter::discover(
-                    project.workspace(),
-                    &interpreter_groups,
-                    workspace_python,
+    let resolved_lock;
+    let lock = match &source {
+        ExportSource::Lockfile { workspace, .. } => workspace.lock(),
+        ExportSource::Manifest(target) => {
+            // Find an interpreter for the project, unless `--frozen` is set.
+            let interpreter = if frozen.is_some() {
+                None
+            } else {
+                Some(match target {
+                    ExportTarget::Script(script) => ScriptInterpreter::discover(
+                        script.into(),
+                        python.as_deref().map(PythonRequest::parse),
+                        &client_builder,
+                        python_preference,
+                        python_downloads,
+                        &install_mirrors,
+                        false,
+                        config_discovery,
+                        ActiveEnvironment::Ignore,
+                        cache,
+                        printer,
+                    )
+                    .await?
+                    .into_interpreter(),
+                    ExportTarget::Project(project) => {
+                        // Selected groups can impose additional Python requirements on a single export.
+                        // Batch entries may have incompatible group requirements, so choose the interpreter
+                        // for locking using only workspace requirements, as `uv lock` does. Each output's
+                        // groups and project defaults are applied separately when rendering below.
+                        let interpreter_groups = if batch.is_some() {
+                            DependencyGroupsWithDefaults::none()
+                        } else {
+                            groups.with_defaults(project.default_groups()?)
+                        };
+                        let workspace_python = WorkspacePython::from_request(
+                            python.as_deref().map(PythonRequest::parse),
+                            Some(project.workspace()),
+                            &interpreter_groups,
+                            project_dir,
+                            config_discovery,
+                        )
+                        .await?;
+                        ProjectInterpreter::discover(
+                            project.workspace(),
+                            &interpreter_groups,
+                            workspace_python,
+                            &client_builder,
+                            python_preference,
+                            python_downloads,
+                            &install_mirrors,
+                            ProjectEnvironmentPolicy::Optional,
+                            ActiveEnvironment::Ignore,
+                            cache,
+                            printer,
+                        )
+                        .await?
+                        .into_interpreter()
+                    }
+                })
+            };
+
+            // Determine the lock mode.
+            let mode = if let Some(frozen_source) = frozen {
+                LockMode::Frozen(frozen_source.into())
+            } else if let LockCheck::Enabled(lock_check) = lock_check {
+                LockMode::Locked(interpreter.as_ref().unwrap(), lock_check)
+            } else if let ExportTarget::Script(script) = target
+                && !LockTarget::Script(script).lock_path().try_exists()?
+            {
+                // If we're locking a script, avoid creating a lockfile if it doesn't already exist.
+                LockMode::DryRun(interpreter.as_ref().unwrap())
+            } else {
+                LockMode::Write(interpreter.as_ref().unwrap())
+            };
+
+            // Initialize any shared state.
+            let state = UniversalState::default();
+
+            resolved_lock = match Box::pin(
+                LockOperation::new(
+                    mode,
+                    &settings,
                     &client_builder,
-                    python_preference,
-                    python_downloads,
-                    &install_mirrors,
-                    ProjectEnvironmentPolicy::Optional,
-                    ActiveEnvironment::Ignore,
+                    &state,
+                    Box::new(DefaultResolveLogger),
+                    &concurrency,
                     cache,
+                    workspace_cache,
                     printer,
+                    preview,
                 )
-                .await?
-                .into_interpreter()
-            }
-        })
-    };
-
-    // Determine the lock mode.
-    let mode = if let Some(frozen_source) = frozen {
-        LockMode::Frozen(frozen_source.into())
-    } else if let LockCheck::Enabled(lock_check) = lock_check {
-        LockMode::Locked(interpreter.as_ref().unwrap(), lock_check)
-    } else if matches!(target, ExportTarget::Script(_))
-        && !LockTarget::from(&target).lock_path().is_file()
-    {
-        // If we're locking a script, avoid creating a lockfile if it doesn't already exist.
-        LockMode::DryRun(interpreter.as_ref().unwrap())
-    } else {
-        LockMode::Write(interpreter.as_ref().unwrap())
-    };
-
-    // Initialize any shared state.
-    let state = UniversalState::default();
-
-    // Lock the project.
-    let lock = match Box::pin(
-        LockOperation::new(
-            mode,
-            &settings,
-            &client_builder,
-            &state,
-            Box::new(DefaultResolveLogger),
-            &concurrency,
-            cache,
-            workspace_cache,
-            printer,
-            preview,
-        )
-        .execute((&target).into()),
-    )
-    .await
-    {
-        Ok(result) => result.into_lock(),
-        Err(err) => return Err(UvError::from(err).into()),
+                .execute((*target).into()),
+            )
+            .await
+            {
+                Ok(result) => result.into_lock(),
+                Err(err) => return Err(UvError::from(err).into()),
+            };
+            &resolved_lock
+        }
     };
 
     if let Some(batch) = &batch {
-        let ExportTarget::Project(project) = &target else {
-            bail!("`--batch` does not support scripts");
-        };
         let mut writers = Vec::with_capacity(batch.export.len());
         for entry in &batch.export {
-            let default_groups = project.default_groups_for_packages(&entry.package)?;
             let groups = DependencyGroups::from_args(
                 None,
                 entry.group.clone(),
@@ -343,8 +392,25 @@ pub(crate) async fn export(
                 entry.no_default_groups,
                 entry.only_group.clone(),
                 entry.all_groups,
-            )
-            .with_defaults(default_groups);
+            );
+            let groups = match &source {
+                ExportSource::Manifest(ExportTarget::Project(project)) => {
+                    groups.with_defaults(project.default_groups_for_packages(&entry.package)?)
+                }
+                ExportSource::Lockfile {
+                    workspace,
+                    project_name,
+                } => {
+                    workspace.validate_packages(&entry.package)?;
+                    resolve_lockfile_groups(&groups, workspace, project_name.as_ref(), &entry.package).with_context(|| format!(
+                        "Batch export `{}` must specify `no-default-groups = true`, `only-group`, or `all-groups = true`",
+                        entry.output_file.display()
+                    ))?
+                }
+                ExportSource::Manifest(ExportTarget::Script(_)) => {
+                    bail!("`--batch` does not support scripts")
+                }
+            };
             let extras = ExtrasSpecification::from_args(
                 entry.extra.clone(),
                 entry.no_extra.clone(),
@@ -355,8 +421,8 @@ pub(crate) async fn export(
             .with_defaults(DefaultExtras::default());
             writers.push(
                 render_export(
-                    &target,
-                    &lock,
+                    &source,
+                    lock,
                     format,
                     entry.all_packages,
                     &entry.package,
@@ -389,16 +455,26 @@ pub(crate) async fn export(
         return Ok(ExitStatus::Success);
     }
 
-    let default_groups = match &target {
-        ExportTarget::Project(project) => project.default_groups()?,
-        ExportTarget::Script(_) => DefaultGroups::default(),
+    let groups = match &source {
+        ExportSource::Manifest(ExportTarget::Project(project)) => {
+            groups.with_defaults(project.default_groups()?)
+        }
+        ExportSource::Manifest(ExportTarget::Script(_)) => {
+            groups.with_defaults(DefaultGroups::default())
+        }
+        ExportSource::Lockfile {
+            workspace,
+            project_name,
+        } => {
+            workspace.validate_packages(&package)?;
+            resolve_lockfile_groups(&groups, workspace, project_name.as_ref(), &package)?
+        }
     };
-    let groups = groups.with_defaults(default_groups);
     let extras = extras.with_defaults(DefaultExtras::default());
 
     render_export(
-        &target,
-        &lock,
+        &source,
+        lock,
         format,
         all_packages,
         &package,
@@ -430,7 +506,7 @@ pub(crate) async fn export(
 /// Render one selection from a shared lockfile, deferring its file write until validation completes.
 #[expect(clippy::fn_params_excessive_bools)]
 async fn render_export<'output>(
-    target: &ExportTarget,
+    source: &ExportSource<'_>,
     lock: &Lock,
     format: Option<ExportFormat>,
     all_packages: bool,
@@ -454,8 +530,8 @@ async fn render_export<'output>(
     preview: Preview,
 ) -> Result<OutputWriter<'output>> {
     // Identify the installation target.
-    let target = match target {
-        ExportTarget::Project(VirtualProject::Project(project)) => {
+    let target = match source {
+        ExportSource::Manifest(ExportTarget::Project(VirtualProject::Project(project))) => {
             if all_packages {
                 InstallTarget::Workspace {
                     workspace: project.workspace(),
@@ -483,7 +559,7 @@ async fn render_export<'output>(
                 }
             }
         }
-        ExportTarget::Project(VirtualProject::NonProject(workspace)) => {
+        ExportSource::Manifest(ExportTarget::Project(VirtualProject::NonProject(workspace))) => {
             if all_packages {
                 InstallTarget::NonProjectWorkspace { workspace, lock }
             } else {
@@ -503,7 +579,18 @@ async fn render_export<'output>(
                 }
             }
         }
-        ExportTarget::Script(script) => InstallTarget::Script { script, lock },
+        ExportSource::Manifest(ExportTarget::Script(script)) => {
+            InstallTarget::Script { script, lock }
+        }
+        ExportSource::Lockfile {
+            workspace,
+            project_name,
+        } => InstallTarget::Lockfile {
+            root: workspace.root(),
+            project_name: project_name.as_ref(),
+            selection: PackageSelection::from_args(all_packages, package, project_name.as_ref()),
+            lock,
+        },
     };
 
     // Validate that the set of requested extras and development groups are defined in the lockfile.
