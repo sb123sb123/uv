@@ -34,8 +34,8 @@ use crate::commands::project::lock::{LockMode, LockOperation};
 use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::lockfile::FrozenWorkspace;
 use crate::commands::project::{
-    ProjectEnvironmentPolicy, ProjectInterpreter, ScriptInterpreter, UniversalState,
-    WorkspacePython, detect_conflicts,
+    ProjectEnvironmentPolicy, ProjectEnvironmentTarget, ProjectInterpreter, ScriptInterpreter,
+    UniversalState, WorkspacePython, detect_conflicts,
 };
 use crate::commands::{ExitStatus, OutputWriter, UvError};
 use crate::printer::Printer;
@@ -323,7 +323,7 @@ pub(crate) async fn export(
                         )
                         .await?;
                         ProjectInterpreter::discover(
-                            project.workspace(),
+                            ProjectEnvironmentTarget::from(project.workspace()),
                             &interpreter_groups,
                             workspace_python,
                             &client_builder,

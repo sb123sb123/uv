@@ -1397,15 +1397,16 @@ pub(crate) fn is_centralized_environment_reference(path: &Path, cache: &Cache) -
             .is_ok_and(|target| is_centralized_environment_path(&target, cache))
 }
 
-/// Return the centralized environment path for a given workspace and interpreter.
+/// Return the centralized environment path for a project and interpreter.
 pub(crate) fn centralized_environment_root(
-    workspace: &Workspace,
+    target: ProjectEnvironmentTarget<'_>,
     interpreter: &Interpreter,
     upgradeable: bool,
     cache: &Cache,
 ) -> PathBuf {
-    let workspace_path = fs_err::canonicalize(workspace.install_path())
-        .unwrap_or_else(|_| workspace.install_path().clone());
+    let install_path = target.install_path();
+    let workspace_path =
+        fs_err::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
     let interpreter_key = interpreter.key();
     // Use the workspace path to isolate projects and the interpreter key to maximize intra-project
     // environment re-use while avoiding clashes with incompatible environments. Ignoring the patch
@@ -1425,11 +1426,9 @@ pub(crate) fn centralized_environment_root(
             interpreter.python_version().clone(),
         )
     };
-    let name = workspace
-        .pyproject_toml()
-        .project
-        .as_ref()
-        .and_then(|project| cache_name(project.name.as_ref(), Some(100)))
+    let name = target
+        .project_name()
+        .and_then(|name| cache_name(name.as_ref(), Some(100)))
         .or_else(|| {
             workspace_path
                 .file_name()
@@ -1526,6 +1525,46 @@ pub(crate) fn update_project_environment_link(
     false
 }
 
+/// The project information needed to discover and create an environment.
+#[derive(Clone, Copy)]
+pub(crate) enum ProjectEnvironmentTarget<'a> {
+    Workspace(&'a Workspace),
+    Lockfile { root: &'a Path, lock: &'a Lock },
+}
+
+impl<'a> From<&'a Workspace> for ProjectEnvironmentTarget<'a> {
+    fn from(workspace: &'a Workspace) -> Self {
+        Self::Workspace(workspace)
+    }
+}
+
+impl<'a> ProjectEnvironmentTarget<'a> {
+    fn install_path(self) -> &'a Path {
+        match self {
+            Self::Workspace(workspace) => workspace.install_path(),
+            Self::Lockfile { root, .. } => root,
+        }
+    }
+
+    fn project_name(self) -> Option<&'a PackageName> {
+        match self {
+            Self::Workspace(workspace) => workspace
+                .pyproject_toml()
+                .project
+                .as_ref()
+                .map(|project| &project.name),
+            Self::Lockfile { lock, .. } => lock.root().map(uv_lock::Package::name),
+        }
+    }
+
+    fn workspace(self) -> Option<&'a Workspace> {
+        match self {
+            Self::Workspace(workspace) => Some(workspace),
+            Self::Lockfile { .. } => None,
+        }
+    }
+}
+
 /// An interpreter suitable for the project.
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant)]
@@ -1564,9 +1603,9 @@ impl ProjectInterpreter {
         )
     }
 
-    /// Discover the interpreter to use in the current [`Workspace`].
+    /// Discover an interpreter for a workspace or frozen lockfile.
     pub(crate) async fn discover(
-        workspace: &Workspace,
+        target: ProjectEnvironmentTarget<'_>,
         groups: &DependencyGroupsWithDefaults,
         workspace_python: WorkspacePython,
         client_builder: &BaseClientBuilder<'_>,
@@ -1587,7 +1626,8 @@ impl ProjectInterpreter {
             .as_ref()
             .map(|requirement| &requirement.requires_python);
 
-        let environment_selection = workspace.environment_selection(active);
+        let environment_selection =
+            ProjectEnvironmentSelection::from_install_path(target.install_path(), active);
         let centralized = centralized_environments_enabled(&environment_selection, cache);
         let upgradeable = python_request
             .as_ref()
@@ -1596,7 +1636,7 @@ impl ProjectInterpreter {
         // Prefer `.venv`'s interpreter to keep its compatible cached environment selected; derive
         // the cache root instead of trusting the link target.
         if centralized {
-            let project_environment_path = workspace.install_path().join(".venv");
+            let project_environment_path = target.install_path().join(".venv");
             if let Ok(candidate) = PythonEnvironment::from_root(
                 read_environment_path_file(&project_environment_path)
                     .ok()
@@ -1605,7 +1645,7 @@ impl ProjectInterpreter {
                 cache,
             ) {
                 let root = centralized_environment_root(
-                    workspace,
+                    target,
                     candidate.interpreter(),
                     upgradeable,
                     cache,
@@ -1625,7 +1665,7 @@ impl ProjectInterpreter {
         } else {
             let project_environment_path = environment_selection
                 .explicit_path()
-                .map_or_else(|| workspace.install_path().join(".venv"), Path::to_path_buf);
+                .map_or_else(|| target.install_path().join(".venv"), Path::to_path_buf);
             // TODO(tk): Revisit after PEP 832.
             // A centralized path file is not a local environment; let initialization replace it.
             if !(environment_selection.is_default()
@@ -1664,7 +1704,7 @@ impl ProjectInterpreter {
 
         if centralized {
             let root =
-                centralized_environment_root(workspace, python.interpreter(), upgradeable, cache);
+                centralized_environment_root(target, python.interpreter(), upgradeable, cache);
             if let Some(environment) = discover_project_environment(
                 &root,
                 python_request.as_ref(),
@@ -1704,7 +1744,7 @@ impl ProjectInterpreter {
         if let Some(requirement) = requirement.as_ref() {
             let requirement_source = match &requirement.source {
                 WorkspacePythonRequirementSource::Workspace => {
-                    PythonRequirementSource::Workspace(Some(workspace), groups)
+                    PythonRequirementSource::Workspace(target.workspace(), groups)
                 }
                 WorkspacePythonRequirementSource::Lockfile { locked, groups } => {
                     PythonRequirementSource::Lockfile { locked, groups }
@@ -1811,16 +1851,16 @@ impl WorkspacePython {
     /// Determine the Python request and requirement from a frozen lockfile.
     async fn from_lockfile(
         python_request: Option<PythonRequest>,
-        workspace: &Workspace,
         target: InstallTarget<'_>,
         groups: &DependencyGroupsWithDefaults,
+        project_dir: &Path,
         config_discovery: ConfigDiscovery,
     ) -> Result<Self, ProjectError> {
         Self::from_requirements(
             python_request,
-            Some(workspace.install_path()),
+            Some(target.install_path()),
             Some(find_lockfile_requires_python(target, groups)?),
-            workspace.install_path(),
+            project_dir,
             config_discovery,
         )
         .await
@@ -2080,8 +2120,14 @@ impl ProjectEnvironment {
             .ok();
 
         let workspace_python = if let Some(target) = frozen_target {
-            WorkspacePython::from_lockfile(python, workspace, target, groups, config_discovery)
-                .await?
+            WorkspacePython::from_lockfile(
+                python,
+                target,
+                groups,
+                workspace.install_path(),
+                config_discovery,
+            )
+            .await?
         } else {
             WorkspacePython::from_request(
                 python,
@@ -2098,7 +2144,7 @@ impl ProjectEnvironment {
             .is_none_or(|request| !request.includes_patch());
 
         match ProjectInterpreter::discover(
-            workspace,
+            ProjectEnvironmentTarget::from(workspace),
             groups,
             workspace_python,
             client_builder,
@@ -2127,7 +2173,12 @@ impl ProjectEnvironment {
             // Otherwise, create a virtual environment with the discovered interpreter.
             ProjectInterpreter::Interpreter(interpreter) => {
                 let root = if centralized {
-                    centralized_environment_root(workspace, &interpreter, upgradeable, cache)
+                    centralized_environment_root(
+                        ProjectEnvironmentTarget::from(workspace),
+                        &interpreter,
+                        upgradeable,
+                        cache,
+                    )
                 } else {
                     environment_selection
                         .explicit_path()
