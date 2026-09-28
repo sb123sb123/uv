@@ -569,14 +569,92 @@ mod tests {
     fn ok_multiple_tags() {
         insta::assert_debug_snapshot!(WheelFilename::from_str(
             "foo-1.2.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
-        ));
+        ), @r#"
+        Ok(
+            WheelFilename {
+                name: PackageName(
+                    "foo",
+                ),
+                version: "1.2.3",
+                tags: Large {
+                    large: WheelTagLarge {
+                        build_tag: None,
+                        python_tag: [
+                            CPython {
+                                python_version: (
+                                    3,
+                                    11,
+                                ),
+                            },
+                        ],
+                        abi_tag: [
+                            CPython {
+                                python_version: (
+                                    3,
+                                    11,
+                                ),
+                                variant: CPythonAbiVariants(
+                                    0,
+                                ),
+                            },
+                        ],
+                        platform_tag: [
+                            Manylinux {
+                                major: 2,
+                                minor: 17,
+                                arch: X86_64,
+                            },
+                            Manylinux2014 {
+                                arch: X86_64,
+                            },
+                        ],
+                        variant: None,
+                        repr: "cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64",
+                    },
+                },
+            },
+        )
+        "#);
     }
 
     #[test]
     fn ok_build_tag() {
         insta::assert_debug_snapshot!(WheelFilename::from_str(
             "foo-1.2.3-202206090410-py3-none-any.whl"
-        ));
+        ), @r#"
+        Ok(
+            WheelFilename {
+                name: PackageName(
+                    "foo",
+                ),
+                version: "1.2.3",
+                tags: Large {
+                    large: WheelTagLarge {
+                        build_tag: Some(
+                            BuildTag(
+                                202206090410,
+                                None,
+                            ),
+                        ),
+                        python_tag: [
+                            Python {
+                                major: 3,
+                                minor: None,
+                            },
+                        ],
+                        abi_tag: [
+                            None,
+                        ],
+                        platform_tag: [
+                            Any,
+                        ],
+                        variant: None,
+                        repr: "202206090410-py3-none-any",
+                    },
+                },
+            },
+        )
+        "#);
     }
 
     #[test]
@@ -622,7 +700,28 @@ mod tests {
             "numpy-2.3.2-py3-none-any-cpu_É.whl",
         ]
         .map(|filename| WheelFilename::from_str(filename).map_err(|error| error.to_string()));
-        insta::assert_debug_snapshot!(errors);
+        insta::assert_debug_snapshot!(errors, @r#"
+        [
+            Err(
+                "The wheel filename \"numpy-2.3.2-3py-none-any.whl\" is invalid: Python tag must not start with a digit",
+            ),
+            Err(
+                "The wheel filename \"numpy-2.3.2-7-3py-none-any-null.whl\" is invalid: Python tag must not start with a digit",
+            ),
+            Err(
+                "The wheel filename \"numpy-2.3.2-py3-none-any-.whl\" has an invalid variant label: must not be empty",
+            ),
+            Err(
+                "The wheel filename \"numpy-2.3.2-py3-none-any-cpu_!v3.whl\" has an invalid variant label: must contain only lowercase ASCII letters, digits, underscores, and periods",
+            ),
+            Err(
+                "The wheel filename \"numpy-2.3.2-py3-none-any-CUDA.whl\" has an invalid variant label: must contain only lowercase ASCII letters, digits, underscores, and periods",
+            ),
+            Err(
+                "The wheel filename \"numpy-2.3.2-py3-none-any-cpu_É.whl\" has an invalid variant label: must contain only lowercase ASCII letters, digits, underscores, and periods",
+            ),
+        ]
+        "#);
     }
 
     #[test]
