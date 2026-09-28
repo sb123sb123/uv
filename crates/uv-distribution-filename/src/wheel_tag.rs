@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use crate::BuildTag;
+use crate::{BuildTag, VariantLabel};
 use uv_platform_tags::{AbiTag, LanguageTag, PlatformTag, TagCompatibility, Tags};
 use uv_small_str::SmallString;
 
@@ -11,14 +11,14 @@ use uv_small_str::SmallString;
 pub(crate) type TagSet<T> = smallvec::SmallVec<[T; 3]>;
 
 /// The portion of the wheel filename following the name and version: the optional build tag, along
-/// with the Python tag(s), ABI tag(s), and platform tag(s).
+/// with the Python tag(s), ABI tag(s), platform tag(s), and optional variant label.
 ///
 /// Most wheels consist of a single Python, ABI, and platform tag (and no build tag). We represent
 /// such wheels with [`WheelTagSmall`], a variant with a smaller memory footprint and (generally)
 /// zero allocations. The [`WheelTagLarge`] variant is used for wheels with multiple tags, a build
-/// tag, or an unsupported tag (i.e., a tag that can't be represented by [`LanguageTag`],
-/// [`AbiTag`], or [`PlatformTag`]). (Unsupported tags are filtered out, but retained in the display
-/// representation of [`WheelTagLarge`].)
+/// tag, a variant label, or an unsupported tag (i.e., a tag that can't be represented by
+/// [`LanguageTag`], [`AbiTag`], or [`PlatformTag`]). Unsupported tags are filtered out, but retained
+/// in the display representation of [`WheelTagLarge`].
 #[derive(
     Debug,
     Clone,
@@ -151,6 +151,8 @@ pub(crate) struct WheelTagLarge {
     pub(crate) abi_tag: TagSet<AbiTag>,
     /// The platform tag(s), e.g., `none` in `1.2.3-73-py3-none-any`.
     pub(crate) platform_tag: TagSet<PlatformTag>,
+    /// The optional variant label.
+    pub(crate) variant: Option<VariantLabel>,
     /// The string representation of the tag.
     ///
     /// Preserves any unsupported tags that were filtered out when parsing the wheel filename.
