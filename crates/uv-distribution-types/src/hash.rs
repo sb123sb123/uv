@@ -1,6 +1,24 @@
 use uv_pypi_types::{HashAlgorithm, HashDigest, HashDigests, Hashes};
 use uv_redacted::DisplaySafeUrl;
 
+/// Groups of alternative hashes that must all match the same archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveHashGroups {
+    groups: Vec<Vec<HashDigest>>,
+    digests: Vec<HashDigest>,
+}
+
+impl ArchiveHashGroups {
+    pub fn new(groups: Vec<Vec<HashDigest>>) -> Self {
+        let digests = groups.iter().flatten().cloned().collect();
+        Self { groups, digests }
+    }
+
+    pub fn groups(&self) -> &[Vec<HashDigest>] {
+        &self.groups
+    }
+}
+
 /// Hash generation and validation policy for an archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveHashPolicy<'a> {
@@ -15,17 +33,19 @@ pub enum ArchiveHashPolicy<'a> {
     /// Hashes should be validated against a pre-defined list of hashes, and every digest must
     /// match. If necessary, hashes should be generated so as to ensure that the archive is valid.
     All(&'a [HashDigest]),
+    /// At least one hash in each group must match.
+    AllOfAny(&'a ArchiveHashGroups),
 }
 
 impl<'a> ArchiveHashPolicy<'a> {
     /// Use the hashes advertised for an individual index file when no verification policy is set.
     ///
-    /// Explicit [`Self::Any`] and [`Self::All`] policies take precedence, including empty policies
-    /// that must reject the distribution. If the index provides no hashes, preserve the policy.
+    /// Explicit verification policies take precedence, including empty policies that must reject
+    /// the distribution. If the index provides no hashes, preserve the policy.
     #[must_use]
     pub fn with_index_hashes(self, hashes: &'a [HashDigest]) -> Self {
         match self {
-            Self::Any(_) | Self::All(_) => self,
+            Self::Any(_) | Self::All(_) | Self::AllOfAny(_) => self,
             Self::None | Self::Generate => {
                 if hashes.is_empty() {
                     self
@@ -41,9 +61,9 @@ impl<'a> ArchiveHashPolicy<'a> {
         matches!(self, Self::None)
     }
 
-    /// Returns `true` if the hash policy is `Any` or `All`.
+    /// Returns `true` if the hash policy requires verification.
     pub fn requires_validation(&self) -> bool {
-        matches!(self, Self::Any(_) | Self::All(_))
+        matches!(self, Self::Any(_) | Self::All(_) | Self::AllOfAny(_))
     }
 
     /// Return the algorithms used in the hash policy.
@@ -51,8 +71,12 @@ impl<'a> ArchiveHashPolicy<'a> {
         match self {
             Self::None => vec![],
             Self::Generate => vec![HashAlgorithm::Sha256],
-            Self::Any(hashes) | Self::All(hashes) => {
-                let mut algorithms = hashes.iter().map(HashDigest::algorithm).collect::<Vec<_>>();
+            Self::Any(_) | Self::All(_) | Self::AllOfAny(_) => {
+                let mut algorithms = self
+                    .digests()
+                    .iter()
+                    .map(HashDigest::algorithm)
+                    .collect::<Vec<_>>();
                 algorithms.sort();
                 algorithms.dedup();
                 algorithms
@@ -66,6 +90,7 @@ impl<'a> ArchiveHashPolicy<'a> {
             Self::None => &[],
             Self::Generate => &[],
             Self::Any(hashes) | Self::All(hashes) => hashes,
+            Self::AllOfAny(groups) => &groups.digests,
         }
     }
 
@@ -81,6 +106,12 @@ impl<'a> ArchiveHashPolicy<'a> {
             }
             Self::All(required) => {
                 !required.is_empty() && required.iter().all(|hash| hashes.contains(hash))
+            }
+            Self::AllOfAny(groups) => {
+                !groups.groups.is_empty()
+                    && groups.groups.iter().all(|group| {
+                        !group.is_empty() && group.iter().any(|hash| hashes.contains(hash))
+                    })
             }
         }
     }
@@ -105,6 +136,16 @@ impl<'a> ArchiveHashPolicy<'a> {
                         .iter()
                         .map(HashDigest::algorithm)
                         .all(|algorithm| hashes.iter().any(|hash| hash.algorithm() == algorithm))
+            }
+            Self::AllOfAny(groups) => {
+                !groups.groups.is_empty()
+                    && groups.groups.iter().all(|group| {
+                        !group.is_empty()
+                            && (group.iter().any(|hash| hashes.contains(hash))
+                                || group.iter().map(HashDigest::algorithm).all(|algorithm| {
+                                    hashes.iter().any(|hash| hash.algorithm() == algorithm)
+                                }))
+                    })
             }
         }
     }

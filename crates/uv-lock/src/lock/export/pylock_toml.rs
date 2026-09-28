@@ -21,7 +21,7 @@ use uv_configuration::{
     InstallOptions,
 };
 use uv_distribution_filename::{
-    BuildTag, DistExtension, ExtensionError, SourceDistExtension, SourceDistFilename,
+    BuildTag, DistExtension, DistFilename, ExtensionError, SourceDistExtension, SourceDistFilename,
     SourceDistFilenameError, WheelFilename, WheelFilenameError,
 };
 use uv_distribution_types::{
@@ -1473,6 +1473,42 @@ impl<'lock> PylockToml {
 }
 
 impl PylockTomlPackage {
+    /// Return registry artifact URLs and their parsed filenames.
+    ///
+    /// The URLs and filenames must still be checked against the registry's metadata.
+    pub fn registry_artifacts(&self) -> Option<Vec<(&DisplaySafeUrl, DistFilename)>> {
+        if self.archive.is_some() || self.directory.is_some() || self.vcs.is_some() {
+            return None;
+        }
+        let mut artifacts = Vec::new();
+        if let Some(sdist) = &self.sdist {
+            if sdist.path.is_some() {
+                return None;
+            }
+            let url = sdist.url.as_ref()?;
+            let filename = sdist.filename(&self.name).ok()?;
+            let DistFilename::SourceDistFilename(filename) =
+                DistFilename::try_from_filename(&filename, &self.name)?
+            else {
+                return None;
+            };
+            artifacts.push((url, DistFilename::SourceDistFilename(filename)));
+        }
+        for wheel in self.wheels.iter().flatten() {
+            if wheel.path.is_some() {
+                return None;
+            }
+            let url = wheel.url.as_ref()?;
+            let filename = wheel.filename(&self.name).ok()?.into_owned();
+            artifacts.push((url, DistFilename::WheelFilename(filename)));
+        }
+        if artifacts.is_empty() {
+            None
+        } else {
+            Some(artifacts)
+        }
+    }
+
     /// Return every wheel and source distribution URL for a registry package.
     ///
     /// Return `None` for packages that use other source types, contain local paths, or have no

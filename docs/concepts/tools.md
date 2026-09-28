@@ -163,6 +163,47 @@ To reinstall a single package in a tool environment:
 $ uv tool upgrade black --reinstall-package click
 ```
 
+## Using a packaged lock
+
+With the `locked-tools` [preview feature](preview.md), `--locked` installs a tool's dependencies
+from the `pylock.toml` shipped in its wheel's `.dist-info` directory:
+
+```console
+$ uv tool install --preview-features locked-tools --locked example-tool
+$ uvx --preview-features locked-tools --locked example-tool
+$ uv tool upgrade --preview-features locked-tools --locked example-tool
+```
+
+uv selects a compatible wheel of the tool before reading its lock. Versions without a compatible
+wheel can be skipped, and a tool available only as a source distribution cannot be installed with
+`--locked`. Git sources are not supported for the tool itself. Once a wheel is selected, a missing
+or unusable lock is an error; uv does not resolve different runtime dependency versions or try an
+older tool release to find a usable lock. Artifact hashes are required and checked against the lock.
+Selected dependency artifacts must have a supported hash other than MD5; MD5 hashes are ignored.
+When an index provides a supported non-MD5 hash for an artifact, uv checks it as well. Every
+dependency must use a wheel or source distribution listed by its configured package index for its
+locked name and version, with the filename recorded by the index. uv verifies this before accessing
+artifacts, including files for other platforms or extras. Cached index metadata can be used for this
+check, even after it expires. Local paths, VCS sources, and direct archives are not supported.
+Offline installation requires cached index metadata; `--no-index` prevents this verification.
+
+If a dependency is built from a source distribution, its build requirements are resolved separately
+and are not pinned by the packaged lock. uv checks the source archive's lock, index, and constraint
+hashes before running the build backend.
+
+Installed tools remember `--locked`, so subsequent upgrades continue using packaged locks and
+require the preview feature. Use `--unlocked` to return to normal dependency resolution. Set
+`UV_TOOL_LOCKED=1` to enable locked tool operations by default. Locked runs use a cache environment
+based on the packaged lock instead of reusing an installed tool with potentially different
+dependencies.
+
+`--with`, dependency overrides, and exclusions cannot be combined with `--locked`. Constraints are
+accepted when they are compatible with the locked dependencies. Requested extras and dependency
+groups must be included in the packaged lock.
+
+[`uv build`](projects/build.md#including-a-dependency-lock) can include these locks in wheels. Its
+exports do not currently include extras or dependency groups.
+
 ## Including additional dependencies
 
 Additional packages can be included during tool execution:
