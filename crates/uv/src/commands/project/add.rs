@@ -318,7 +318,6 @@ pub(crate) async fn add(
             .await?;
             let interpreter = ProjectInterpreter::discover(
                 ProjectEnvironmentTarget::from(project.workspace()),
-                &defaulted_groups,
                 workspace_python,
                 &client_builder,
                 python_preference,

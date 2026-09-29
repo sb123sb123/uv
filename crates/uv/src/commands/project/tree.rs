@@ -152,7 +152,6 @@ pub(crate) async fn tree(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::from(workspace),
-                    &groups,
                     workspace_python,
                     client_builder,
                     python_preference,
@@ -189,7 +188,6 @@ pub(crate) async fn tree(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::Lockfile { root, lock },
-                    &groups,
                     workspace_python,
                     client_builder,
                     python_preference,

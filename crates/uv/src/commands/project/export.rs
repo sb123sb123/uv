@@ -324,7 +324,6 @@ pub(crate) async fn export(
                         .await?;
                         ProjectInterpreter::discover(
                             ProjectEnvironmentTarget::from(project.workspace()),
-                            &interpreter_groups,
                             workspace_python,
                             &client_builder,
                             python_preference,

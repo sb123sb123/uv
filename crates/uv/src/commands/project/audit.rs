@@ -150,7 +150,6 @@ pub(crate) async fn audit(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::from(workspace),
-                    &groups,
                     workspace_python,
                     &client_builder,
                     python_preference,

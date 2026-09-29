@@ -164,7 +164,6 @@ pub(crate) async fn lock(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::from(workspace),
-                    &groups,
                     workspace_python,
                     &client_builder,
                     python_preference,

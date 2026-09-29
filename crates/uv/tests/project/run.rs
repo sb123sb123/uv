@@ -5574,6 +5574,16 @@ fn run_groups_requires_python_errors() -> Result<()> {
     error: The requested interpreter resolved to Python 3.12.[X], which is incompatible with the project's Python requirement: `>=3.13` (from `tool.uv.dependency-groups.dev.requires-python`).
     ");
 
+    // An isolated environment must satisfy the selected groups too.
+    uv_snapshot!(context.filters(), context.run()
+        .arg("--isolated")
+        .arg("-p").arg("3.12")
+        .arg("python").arg("--version"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: The requested interpreter resolved to Python 3.12.[X], which is incompatible with the project's Python requirement: `>=3.13` (from `tool.uv.dependency-groups.dev.requires-python`).
+    ");
+
     // Enabling foo we can't find an interpreter
     uv_snapshot!(context.filters(), context.run()
         .arg("--group").arg("foo")

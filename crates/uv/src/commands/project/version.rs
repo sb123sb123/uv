@@ -585,7 +585,6 @@ async fn lock_and_sync(
         .await?;
         let interpreter = ProjectInterpreter::discover(
             ProjectEnvironmentTarget::from(project.workspace()),
-            &groups,
             workspace_python,
             &client_builder,
             python_preference,

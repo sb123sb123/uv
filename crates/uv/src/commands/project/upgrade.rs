@@ -218,7 +218,6 @@ pub(crate) async fn upgrade(
         .await?;
         match ProjectInterpreter::discover(
             ProjectEnvironmentTarget::from(project.workspace()),
-            &groups,
             workspace_python,
             &client_builder,
             python_preference,
@@ -377,7 +376,6 @@ pub(crate) async fn upgrade(
         .await?;
         ProjectInterpreter::discover(
             ProjectEnvironmentTarget::from(project.workspace()),
-            &groups,
             workspace_python,
             &client_builder,
             python_preference,
