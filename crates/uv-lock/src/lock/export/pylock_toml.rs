@@ -443,6 +443,24 @@ struct PylockTomlAttestationIdentity {
 }
 
 impl<'lock> PylockToml {
+    /// Find a workspace dependency among the packages selected for export.
+    pub fn workspace_dependency(
+        target: &impl Installable<'lock>,
+        extras: &ExtrasSpecificationWithDefaults,
+        dev: &DependencyGroupsWithDefaults,
+        install_options: &'lock InstallOptions,
+    ) -> Result<Option<&'lock PackageName>, PylockTomlErrorKind> {
+        let ExportableRequirements(nodes) =
+            ExportableRequirements::from_lock(target, &[], extras, dev, false, install_options)?;
+        Ok(nodes
+            .iter()
+            .find(|node| {
+                target.lock().is_workspace_package(node.package)
+                    && node.package.id.source.is_local()
+            })
+            .map(|node| node.package.name()))
+    }
+
     /// Construct a [`PylockToml`] from a [`ResolverOutput`].
     ///
     /// If `tags` is provided, only wheels compatible with the given tags will be included.
@@ -1063,6 +1081,13 @@ impl<'lock> PylockToml {
         })
     }
 
+    /// Returns `true` if any dependency cannot be installed as a registry distribution.
+    pub fn has_non_registry_sources(&self) -> bool {
+        self.packages
+            .iter()
+            .any(|package| package.index.is_none() || package.registry_artifact_urls().is_none())
+    }
+
     /// Returns `true` if any distribution file is missing the hashes required by PEP 751.
     pub fn has_missing_hashes(&self) -> bool {
         self.packages.iter().any(|package| {
@@ -1448,6 +1473,30 @@ impl<'lock> PylockToml {
 }
 
 impl PylockTomlPackage {
+    /// Return every wheel and source distribution URL for a registry package.
+    ///
+    /// Return `None` for packages that use other source types, contain local paths, or have no
+    /// artifact URLs. The URLs still need to be checked against the registry's metadata.
+    pub fn registry_artifact_urls(&self) -> Option<Vec<&DisplaySafeUrl>> {
+        if self.archive.is_some() || self.directory.is_some() || self.vcs.is_some() {
+            return None;
+        }
+
+        let urls = self
+            .sdist
+            .iter()
+            .map(|sdist| (&sdist.path, &sdist.url))
+            .chain(
+                self.wheels
+                    .iter()
+                    .flatten()
+                    .map(|wheel| (&wheel.path, &wheel.url)),
+            )
+            .map(|(path, url)| if path.is_some() { None } else { url.as_ref() })
+            .collect::<Option<Vec<_>>>()?;
+        if urls.is_empty() { None } else { Some(urls) }
+    }
+
     /// Convert the [`PylockTomlPackage`] to a TOML [`Table`].
     fn to_toml(&self) -> Result<Table, toml_edit::ser::Error> {
         let mut table = Table::new();

@@ -11,7 +11,7 @@ pre-built artifacts that can be installed directly.
 !!! important
 
     When using `uv build`, uv acts as a [build frontend](https://peps.python.org/pep-0517/#terminology-and-goals)
-    and only determines the Python version to use and invokes the build backend. The details of
+    and determines the Python version to use and invokes the build backend. The details of
     the builds, such as the included files and the distribution filenames, are determined by the build
     backend, as defined in [`[build-system]`](./config.md#build-systems). Information about build
     configuration can be found in the respective tool's documentation.
@@ -38,6 +38,36 @@ that source distribution.
 You can limit `uv build` to building a source distribution with `uv build --sdist`, a binary
 distribution with `uv build --wheel`, or build both distributions from source with
 `uv build --sdist --wheel`.
+
+## Including a dependency lock
+
+!!! warning "Preview feature"
+
+    This feature is experimental and may change. Enable it with
+    `--preview-features locked-tools`.
+
+When a project uses `uv_build`, `uv build` includes its runtime dependencies as a `pylock.toml` in
+its wheel if a `uv.lock` exists and its dependencies come from PyPI. The source distribution
+includes `uv.lock`, so a subsequent `uv build` can include the lock when building a wheel from it.
+The project itself is supplied by the wheel and is not listed in `pylock.toml`. Workspace members
+may use a shared lock, but cannot have runtime dependencies on other workspace members. The lock
+does not include optional extras. Locks restricted to specific environments are not supported.
+
+Set `tool.uv.export-lock = true` to include a lock when using another build backend or package
+index, or set it to `false` to disable export. `UV_EXPORT_LOCK` overrides this setting. Enabling
+export requires an existing `uv.lock` with URLs and hashes for registry artifacts; Git and local
+dependencies are not supported. The entire `uv.lock`, including source locations and metadata for
+other workspace members, is included in the source distribution. Review its contents before
+publishing it.
+
+uv checks the lock against the workspace without network access. If the check cannot complete
+offline, automatic export is skipped and explicitly enabled export fails. A source distribution may
+omit other workspace members needed for this check, so a later build from that distribution may not
+include the lock. Building the source distribution and wheel together uses the original workspace
+for the check.
+
+The export is performed by `uv build`. Other frontends, including `python -m build`, do not include
+the lock automatically.
 
 ## Build constraints
 

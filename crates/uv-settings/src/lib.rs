@@ -316,6 +316,7 @@ fn validate_uv_toml(path: &Path, options: &Options) -> Result<(), Error> {
         managed,
         package,
         build_backend,
+        export_lock,
     } = options;
     // The `uv.toml` format is not allowed to include any of the following, which are
     // permitted by the schema since they _can_ be included in `pyproject.toml` files
@@ -358,6 +359,9 @@ fn validate_uv_toml(path: &Path, options: &Options) -> Result<(), Error> {
             path.to_path_buf(),
             "build-backend",
         ));
+    }
+    if export_lock.is_some() {
+        return Err(Error::PyprojectOnlyField(path.to_path_buf(), "export-lock"));
     }
     if environments.is_some() {
         return Err(Error::PyprojectOnlyField(
@@ -473,6 +477,7 @@ fn warn_uv_toml_masked_fields(options: &Options) {
         managed: _,
         package: _,
         build_backend: _,
+        export_lock: _,
     } = options;
 
     let mut masked_fields = vec![];

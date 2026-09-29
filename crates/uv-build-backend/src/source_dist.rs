@@ -37,6 +37,23 @@ pub fn build_source_dist(
     uv_version: &str,
     show_warnings: bool,
 ) -> Result<SourceDistFilename, Error> {
+    build_source_dist_with_lock(
+        source_tree,
+        source_dist_directory,
+        uv_version,
+        show_warnings,
+        None,
+    )
+}
+
+/// Build a source distribution with an optional precomputed project lock.
+pub fn build_source_dist_with_lock(
+    source_tree: &Path,
+    source_dist_directory: &Path,
+    uv_version: &str,
+    show_warnings: bool,
+    lock: Option<&[u8]>,
+) -> Result<SourceDistFilename, Error> {
     let pyproject_toml = PyProjectToml::parse(&source_tree.join("pyproject.toml"))?;
     let filename = SourceDistFilename {
         name: pyproject_toml.name().clone(),
@@ -52,10 +69,10 @@ pub fn build_source_dist(
     let temp_file = uv_fs::tempfile_in(source_dist_directory)?;
     if uv_preview::is_enabled(PreviewFeature::TarCodec) {
         let writer = TarCodecGzWriter::new(temp_file.as_file(), &source_dist_path);
-        write_source_dist(source_tree, writer, uv_version, show_warnings)?;
+        write_source_dist(source_tree, writer, uv_version, show_warnings, lock)?;
     } else {
         let writer = TokioTarGzWriter::new(temp_file.as_file(), &source_dist_path);
-        write_source_dist(source_tree, writer, uv_version, show_warnings)?;
+        write_source_dist(source_tree, writer, uv_version, show_warnings, lock)?;
     }
     temp_file
         .persist(&source_dist_path)
@@ -78,7 +95,7 @@ pub fn list_source_dist(
     };
     let mut files = FileList::new();
     let writer = ListWriter::new(&mut files);
-    write_source_dist(source_tree, writer, uv_version, show_warnings)?;
+    write_source_dist(source_tree, writer, uv_version, show_warnings, None)?;
     Ok((filename, files))
 }
 
@@ -210,6 +227,7 @@ fn write_source_dist(
     mut writer: impl DirectoryWriter,
     uv_version: &str,
     show_warnings: bool,
+    lock: Option<&[u8]>,
 ) -> Result<SourceDistFilename, Error> {
     let pyproject_toml = PyProjectToml::parse(&source_tree.join("pyproject.toml"))?;
     for warning in pyproject_toml.check_build_system(uv_version, BuildKind::Sdist) {
@@ -333,6 +351,9 @@ fn write_source_dist(
             debug!("Ignoring existing `pyproject.toml.orig`");
             continue;
         }
+        if lock.is_some() && relative == "uv.lock" {
+            continue;
+        }
 
         error_on_venv(entry.file_name(), entry.path())?;
 
@@ -350,6 +371,10 @@ fn write_source_dist(
         )?;
     }
     debug!("Visited {files_visited} files for source dist build");
+
+    if let Some(lock) = lock {
+        writer.write_bytes(&format!("{top_level}/uv.lock"), lock)?;
+    }
 
     writer.close(&top_level)?;
 

@@ -50,6 +50,25 @@ pub fn build_wheel(
     uv_version: &str,
     show_warnings: bool,
 ) -> Result<WheelFilename, Error> {
+    build_wheel_with_lock(
+        source_tree,
+        wheel_dir,
+        metadata_directory,
+        uv_version,
+        show_warnings,
+        None,
+    )
+}
+
+/// Build a wheel with an optional preformatted lock.
+pub fn build_wheel_with_lock(
+    source_tree: &Path,
+    wheel_dir: &Path,
+    metadata_directory: Option<&Path>,
+    uv_version: &str,
+    show_warnings: bool,
+    lock: Option<&[u8]>,
+) -> Result<WheelFilename, Error> {
     let pyproject_toml = PyProjectToml::parse(&source_tree.join("pyproject.toml"))?;
     for warning in pyproject_toml.check_build_system(uv_version, BuildKind::Wheel) {
         warn_user_once!("{warning}");
@@ -84,6 +103,7 @@ pub fn build_wheel(
         uv_version,
         wheel_writer,
         show_warnings,
+        lock,
     )?;
 
     temp_file
@@ -124,6 +144,7 @@ pub fn list_wheel(
         uv_version,
         writer,
         show_warnings,
+        None,
     )?;
     Ok((filename, files))
 }
@@ -135,6 +156,7 @@ fn write_wheel(
     uv_version: &str,
     mut wheel_writer: impl DirectoryWriter,
     show_warnings: bool,
+    lock: Option<&[u8]>,
 ) -> Result<(), Error> {
     let settings = pyproject_toml
         .settings()
@@ -242,6 +264,9 @@ fn write_wheel(
         source_tree,
         uv_version,
     )?;
+    if let Some(lock) = lock {
+        wheel_writer.write_bytes(&format!("{dist_info_dir}/pylock.toml"), lock)?;
+    }
     wheel_writer.close(&dist_info_dir)?;
 
     Ok(())
@@ -472,11 +497,16 @@ fn write_hashed(
     let mut size: u64 = 0;
     let mut buffer = vec![0; ZIP_STREAM_BUFFER_SIZE];
     loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(read) => read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
+        // Use consistent chunks even when the reader returns a short read.
+        let mut read = 0;
+        while read < buffer.len() {
+            match reader.read(&mut buffer[read..]) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
         if read == 0 {
             // End of file
             break;

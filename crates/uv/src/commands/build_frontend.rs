@@ -1,8 +1,12 @@
+mod archive;
+mod lock;
+
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{fmt, io, iter};
 
 use anyhow::{Context, Result};
@@ -14,14 +18,14 @@ use uv_auth::CredentialsCache;
 use uv_build_backend::check_direct_build;
 use uv_build_frontend::SourceBuild;
 use uv_cache::{Cache, CacheBucket};
-use uv_client::{BaseClientBuilder, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, Connectivity, RegistryClientBuilder};
 use uv_configuration::{
     BuildIsolation, BuildKind, BuildOptions, BuildOutput, Concurrency, Constraints,
     DependencyGroupsWithDefaults, DependencyMode, DependencyModifiers, HashCheckingMode,
     IndexStrategy, KeyringProviderType, NoSources,
 };
 use uv_dispatch::{BuildDispatch, SharedState};
-use uv_distribution::LoweredExtraBuildDependencies;
+use uv_distribution::{DistributionDatabase, LoweredExtraBuildDependencies};
 use uv_distribution_filename::{
     DistFilename, SourceDistExtension, SourceDistFilename, WheelFilename,
 };
@@ -30,7 +34,7 @@ use uv_distribution_types::{
     NameRequirementSpecification, PackageConfigSettings, Requirement, SourceDist,
 };
 use uv_errors::{ErrorOptions, Hinted, Hints, write_error_chain_with_options};
-use uv_fs::{Simplified, normalize_path, relative_to};
+use uv_fs::{Simplified, is_same_file_allow_missing, normalize_path, relative_to};
 use uv_install_wheel::LinkMode;
 use uv_installer::{InstallationStrategy, SatisfiesResult, SitePackages};
 use uv_normalize::PackageName;
@@ -49,11 +53,12 @@ use uv_workspace::pyproject::ExtraBuildDependencies;
 use uv_workspace::{DiscoveryOptions, Workspace, WorkspaceCache, WorkspaceError};
 
 use crate::commands::ExitStatus;
-use crate::commands::pip::operations;
-use crate::commands::project::{ProjectError, find_requires_python};
+use crate::commands::pip::{loggers::DefaultResolveLogger, operations};
+use crate::commands::project::lock::{LockMode, LockOperation};
+use crate::commands::project::{ProjectError, UniversalState, find_requires_python};
 use crate::commands::reporters::PythonDownloadReporter;
 use crate::printer::Printer;
-use crate::settings::ResolverSettings;
+use crate::settings::{BuildLockSettings, LockedFlag, LockedSource, ResolverSettings};
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -81,6 +86,8 @@ pub(crate) enum Error {
     BuildDispatch(AnyErrorBuild),
     #[error(transparent)]
     BuildFrontend(#[from] uv_build_frontend::Error),
+    #[error("Failed to package the project lock")]
+    BuildLock(#[source] anyhow::Error),
     #[error("Failed to check build requirements")]
     RequirementsCheck(#[source] anyhow::Error),
     #[error("Build requirement is not satisfied: `{0}`")]
@@ -216,6 +223,7 @@ pub(crate) async fn build_frontend(
     python: Option<String>,
     install_mirrors: PythonInstallMirrors,
     settings: &ResolverSettings,
+    lock_settings: &BuildLockSettings,
     client_builder: &BaseClientBuilder<'_>,
     config_discovery: ConfigDiscovery,
     python_preference: PythonPreference,
@@ -246,6 +254,7 @@ pub(crate) async fn build_frontend(
         python.as_deref(),
         install_mirrors,
         settings,
+        lock_settings,
         client_builder,
         config_discovery,
         python_preference,
@@ -296,6 +305,7 @@ async fn build_impl(
     python_request: Option<&str>,
     install_mirrors: PythonInstallMirrors,
     settings: &ResolverSettings,
+    lock_settings: &BuildLockSettings,
     client_builder: &BaseClientBuilder<'_>,
     config_discovery: ConfigDiscovery,
     python_preference: PythonPreference,
@@ -486,6 +496,7 @@ async fn build_impl(
             cache,
             workspace_cache,
             printer,
+            lock_settings,
             index_locations,
             client_builder.clone(),
             hash_checking,
@@ -563,6 +574,7 @@ async fn build_package(
     cache: &Cache,
     workspace_cache: &WorkspaceCache,
     printer: Printer,
+    lock_settings: &BuildLockSettings,
     index_locations: &IndexLocations,
     client_builder: BaseClientBuilder<'_>,
     hash_checking: Option<HashCheckingMode>,
@@ -817,13 +829,58 @@ async fn build_package(
         Printer::Quiet | Printer::Silent => BuildOutput::Quiet,
     };
 
+    let database = DistributionDatabase::new(
+        &client,
+        &build_dispatch,
+        concurrency.downloads_semaphore.clone(),
+    );
+    let mut exported_lock = match &source.source {
+        Source::Directory(source_tree) => {
+            lock::export(source_tree, workspace.ok(), &database, preview)
+                .await
+                .map_err(Error::BuildLock)?
+                .map(Arc::new)
+        }
+        Source::File(_) => None,
+    };
+
+    // Validate a workspace lock without making the build depend on network access. Extracted
+    // source distributions do not contain the full workspace needed for this check.
+    let source_workspace =
+        exported_lock
+            .as_ref()
+            .and_then(|_| workspace.ok())
+            .filter(|workspace| {
+                workspace.packages().values().any(|package| {
+                    is_same_file_allow_missing(package.root(), source.path()).unwrap_or(false)
+                })
+            });
+    if let Some(lock) = &exported_lock
+        && !validate_build_lock(
+            lock,
+            source_workspace,
+            lock_settings,
+            &interpreter,
+            &client_builder,
+            concurrency,
+            cache,
+            workspace_cache,
+            preview,
+            &build_constraints,
+            &hasher,
+        )
+        .await?
+    {
+        exported_lock = None;
+    }
+
     let mut build_results = Vec::new();
     match plan {
         BuildPlan::SdistToWheel => {
             // Even when listing files, we still need to build the source distribution for the wheel
             // build.
             if list {
-                let sdist_list = build_sdist(
+                let mut sdist_list = build_sdist(
                     source.path(),
                     &output_dir,
                     build_action,
@@ -837,11 +894,13 @@ async fn build_package(
                     subdirectory,
                     version_id,
                     build_output,
+                    exported_lock.clone(),
                 )
                 .await?;
+                add_build_lock(&mut sdist_list, exported_lock.as_deref()).await?;
                 build_results.push(sdist_list);
             }
-            let sdist_build = build_sdist(
+            let mut sdist_build = build_sdist(
                 source.path(),
                 &output_dir,
                 build_action.force_build(),
@@ -855,8 +914,10 @@ async fn build_package(
                 subdirectory,
                 version_id,
                 build_output,
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut sdist_build, exported_lock.as_deref()).await?;
             build_results.push(sdist_build.clone());
 
             // Extract the source distribution into a temporary directory.
@@ -874,7 +935,7 @@ async fn build_package(
                 Err(err) => return Err(err.into()),
             };
 
-            let wheel_build = build_wheel(
+            let mut wheel_build = build_wheel(
                 &extracted,
                 &output_dir,
                 build_action,
@@ -889,12 +950,14 @@ async fn build_package(
                 version_id,
                 build_output,
                 Some(sdist_build.normalized_filename()),
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut wheel_build, exported_lock.as_deref()).await?;
             build_results.push(wheel_build);
         }
         BuildPlan::Sdist => {
-            let sdist_build = build_sdist(
+            let mut sdist_build = build_sdist(
                 source.path(),
                 &output_dir,
                 build_action,
@@ -908,12 +971,14 @@ async fn build_package(
                 subdirectory,
                 version_id,
                 build_output,
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut sdist_build, exported_lock.as_deref()).await?;
             build_results.push(sdist_build);
         }
         BuildPlan::Wheel => {
-            let wheel_build = build_wheel(
+            let mut wheel_build = build_wheel(
                 source.path(),
                 &output_dir,
                 build_action,
@@ -928,12 +993,14 @@ async fn build_package(
                 version_id,
                 build_output,
                 None,
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut wheel_build, exported_lock.as_deref()).await?;
             build_results.push(wheel_build);
         }
         BuildPlan::SdistAndWheel => {
-            let sdist_build = build_sdist(
+            let mut sdist_build = build_sdist(
                 source.path(),
                 &output_dir,
                 build_action,
@@ -947,10 +1014,12 @@ async fn build_package(
                 subdirectory,
                 version_id,
                 build_output,
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut sdist_build, exported_lock.as_deref()).await?;
 
-            let wheel_build = build_wheel(
+            let mut wheel_build = build_wheel(
                 source.path(),
                 &output_dir,
                 build_action,
@@ -965,8 +1034,10 @@ async fn build_package(
                 version_id,
                 build_output,
                 Some(sdist_build.normalized_filename()),
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut wheel_build, exported_lock.as_deref()).await?;
             build_results.push(sdist_build);
             build_results.push(wheel_build);
         }
@@ -994,7 +1065,44 @@ async fn build_package(
                 Err(err) => return Err(err.into()),
             };
 
-            let wheel_build = build_wheel(
+            let extracted_workspace = Workspace::discover(
+                &extracted,
+                &DiscoveryOptions {
+                    stop_discovery_at: Some(temp_dir.path().to_path_buf()),
+                    ..DiscoveryOptions::default()
+                },
+                cache,
+                workspace_cache,
+            )
+            .await;
+            let mut exported_lock = lock::export(
+                &extracted,
+                extracted_workspace.as_ref().ok().map(AsRef::as_ref),
+                &database,
+                preview,
+            )
+            .await
+            .map_err(Error::BuildLock)?
+            .map(Arc::new);
+            if let Some(lock) = &exported_lock
+                && !validate_build_lock(
+                    lock,
+                    extracted_workspace.as_ref().ok().map(AsRef::as_ref),
+                    lock_settings,
+                    &interpreter,
+                    &client_builder,
+                    concurrency,
+                    cache,
+                    workspace_cache,
+                    preview,
+                    &build_constraints,
+                    &hasher,
+                )
+                .await?
+            {
+                exported_lock = None;
+            }
+            let mut wheel_build = build_wheel(
                 &extracted,
                 &output_dir,
                 build_action,
@@ -1009,13 +1117,161 @@ async fn build_package(
                 version_id,
                 build_output,
                 source_dist.as_ref(),
+                exported_lock.clone(),
             )
             .await?;
+            add_build_lock(&mut wheel_build, exported_lock.as_deref()).await?;
             build_results.push(wheel_build);
         }
     }
 
     Ok(build_results)
+}
+
+async fn validate_build_lock(
+    lock: &lock::ExportedLock,
+    workspace: Option<&Workspace>,
+    lock_settings: &BuildLockSettings,
+    interpreter: &uv_python::Interpreter,
+    client_builder: &BaseClientBuilder<'_>,
+    concurrency: &Concurrency,
+    cache: &Cache,
+    workspace_cache: &WorkspaceCache,
+    preview: Preview,
+    build_constraints: &Constraints,
+    hasher: &HashStrategy,
+) -> Result<bool, Error> {
+    let result = async {
+        let workspace =
+            workspace.context("Cannot verify the lock without the project workspace")?;
+        let settings = lock_settings.resolve(workspace.install_path())?;
+        let offline_client = client_builder.clone().connectivity(Connectivity::Offline);
+        let state = UniversalState::default();
+        Box::pin(
+            LockOperation::new(
+                LockMode::Locked(interpreter, LockedSource::Cli(LockedFlag::Locked)),
+                &settings,
+                &offline_client,
+                &state,
+                Box::new(DefaultResolveLogger),
+                concurrency,
+                cache,
+                workspace_cache,
+                Printer::Silent,
+                preview,
+            )
+            .with_build_policy(build_constraints, hasher)
+            .execute(workspace.into()),
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        if lock.required {
+            return Err(Error::BuildLock(error.context(
+                "Cannot verify that `uv.lock` is up to date offline; run `uv lock` before building",
+            )));
+        }
+        debug!("Not exporting the lock because it could not be verified offline: {error}");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn add_build_lock(
+    message: &mut BuildMessage,
+    lock: Option<&lock::ExportedLock>,
+) -> Result<(), Error> {
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+    match message {
+        BuildMessage::Build {
+            normalized_filename,
+            raw_filename,
+            output_dir,
+            lock_handled,
+        } => {
+            if *lock_handled {
+                return Ok(());
+            }
+            let path = output_dir.join(raw_filename);
+            let result = match normalized_filename {
+                DistFilename::SourceDistFilename(filename) => {
+                    archive::add_to_sdist(&path, filename, lock.contents.as_bytes()).await
+                }
+                DistFilename::WheelFilename(filename) => {
+                    if !wheel_matches_lock(&path, filename, lock).await? {
+                        return Ok(());
+                    }
+                    archive::add_to_wheel(&path, filename, lock.pylock.as_bytes()).await
+                }
+            };
+            if let Err(error) = result {
+                if lock.required {
+                    return Err(Error::BuildLock(error));
+                }
+                debug!(
+                    "Not exporting the lock because it could not be added to the distribution: {error}"
+                );
+            }
+        }
+        BuildMessage::List {
+            normalized_filename,
+            file_list,
+            ..
+        } => match normalized_filename {
+            DistFilename::SourceDistFilename(filename) => {
+                let path = format!(
+                    "{}-{}/uv.lock",
+                    filename.name.as_dist_info_name(),
+                    filename.version
+                );
+                file_list.retain(|(name, _)| name != &path);
+                file_list.push((path, Some(lock.path.clone())));
+            }
+            DistFilename::WheelFilename(filename) => {
+                file_list.push((
+                    format!(
+                        "{}-{}.dist-info/pylock.toml",
+                        filename.name.as_dist_info_name(),
+                        filename.version
+                    ),
+                    None,
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn wheel_matches_lock(
+    path: &Path,
+    filename: &WheelFilename,
+    lock: &lock::ExportedLock,
+) -> Result<bool, Error> {
+    let result = archive::wheel_metadata(path, filename)
+        .await
+        .and_then(|metadata| {
+            if metadata.name != filename.name || metadata.version != filename.version {
+                return Ok(false);
+            }
+            lock.matches_wheel(metadata)
+        });
+    match result {
+        Ok(true) => Ok(true),
+        Ok(false) if lock.required => Err(Error::BuildLock(anyhow::anyhow!(
+            "The built wheel's metadata does not match the project lock"
+        ))),
+        Err(error) if lock.required => Err(Error::BuildLock(error)),
+        result => {
+            debug!(
+                "Not exporting the lock because its wheel metadata could not be verified: {result:?}"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Validate dependencies in the caller-provided environment for `uv build`.
@@ -1125,6 +1381,7 @@ async fn build_sdist(
     subdirectory: Option<&Path>,
     version_id: Option<&str>,
     build_output: BuildOutput,
+    lock: Option<Arc<lock::ExportedLock>>,
 ) -> Result<BuildMessage, Error> {
     let build_result = match action {
         BuildAction::List => {
@@ -1160,12 +1417,14 @@ async fn build_sdist(
             let source_tree = source_tree.to_path_buf();
             let output_dir_ = output_dir.to_path_buf();
             let sources_enabled = sources.is_none();
+            let lock_handled = lock.is_some();
             let filename = tokio::task::spawn_blocking(move || {
-                uv_build_backend::build_source_dist(
+                uv_build_backend::build_source_dist_with_lock(
                     &source_tree,
                     &output_dir_,
                     uv_version::version(),
                     sources_enabled,
+                    lock.as_ref().map(|lock| lock.contents.as_bytes()),
                 )
             })
             .await??
@@ -1178,6 +1437,7 @@ async fn build_sdist(
                 ),
                 raw_filename: filename,
                 output_dir: output_dir.to_path_buf(),
+                lock_handled,
             }
         }
         BuildAction::Pep517 => {
@@ -1219,6 +1479,7 @@ async fn build_sdist(
                 ),
                 raw_filename: filename,
                 output_dir: output_dir.to_path_buf(),
+                lock_handled: false,
             }
         }
     };
@@ -1244,6 +1505,7 @@ async fn build_wheel(
     build_output: BuildOutput,
     // Used for checking source distribution and wheel consistency
     source_dist: Option<&DistFilename>,
+    lock: Option<Arc<lock::ExportedLock>>,
 ) -> Result<BuildMessage, Error> {
     let build_message = match action {
         BuildAction::List => {
@@ -1273,24 +1535,60 @@ async fn build_wheel(
                 .bold()
             )?;
             let source_tree = source_tree.to_path_buf();
-            let output_dir_ = output_dir.to_path_buf();
+            let source_tree_ = source_tree.clone();
+            // Do not publish a wheel containing a lock until its metadata has been checked.
+            let temporary = lock
+                .as_ref()
+                .map(|_| tempfile::tempdir_in(output_dir))
+                .transpose()?;
+            let output_dir_ = temporary
+                .as_ref()
+                .map_or(output_dir, |directory| directory.path())
+                .to_path_buf();
             let sources_enabled = sources.is_none();
-            let filename = tokio::task::spawn_blocking(move || {
-                uv_build_backend::build_wheel(
-                    &source_tree,
+            let lock_handled = lock.is_some();
+            let lock_for_build = lock.clone();
+            let mut filename = tokio::task::spawn_blocking(move || {
+                uv_build_backend::build_wheel_with_lock(
+                    &source_tree_,
                     &output_dir_,
                     None,
                     uv_version::version(),
                     sources_enabled,
+                    lock_for_build.as_ref().map(|lock| lock.pylock.as_bytes()),
                 )
             })
             .await??;
+            if let (Some(lock), Some(temporary)) = (lock.as_deref(), temporary) {
+                let name = filename.to_string();
+                let path = temporary.path().join(&name);
+                match wheel_matches_lock(&path, &filename, lock).await {
+                    Ok(true) => {
+                        uv_fs::rename_with_retry(&path, output_dir.join(name)).await?;
+                    }
+                    Ok(false) => {
+                        let output_dir = output_dir.to_path_buf();
+                        filename = tokio::task::spawn_blocking(move || {
+                            uv_build_backend::build_wheel(
+                                &source_tree,
+                                &output_dir,
+                                None,
+                                uv_version::version(),
+                                sources_enabled,
+                            )
+                        })
+                        .await??;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
             let raw_filename = filename.to_string();
             BuildMessage::Build {
                 normalized_filename: DistFilename::WheelFilename(filename),
                 raw_filename,
                 output_dir: output_dir.to_path_buf(),
+                lock_handled,
             }
         }
         BuildAction::Pep517 => {
@@ -1331,6 +1629,7 @@ async fn build_wheel(
                 ),
                 raw_filename: filename,
                 output_dir: output_dir.to_path_buf(),
+                lock_handled: false,
             }
         }
     };
@@ -1466,6 +1765,8 @@ enum BuildMessage {
         raw_filename: String,
         /// The location of the built distribution.
         output_dir: PathBuf,
+        /// Whether the direct build handled the lock.
+        lock_handled: bool,
     },
     /// Show the list of files that would be included in a distribution.
     List {
