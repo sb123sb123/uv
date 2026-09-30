@@ -28,8 +28,8 @@ use crate::commands::project::lock::{LockMode, LockOperation};
 use crate::commands::project::lock_target::LockTarget;
 use crate::commands::project::lockfile::FrozenWorkspace;
 use crate::commands::project::{
-    ProjectEnvironmentPolicy, ProjectEnvironmentTarget, ProjectInterpreter, ScriptInterpreter,
-    UniversalState, WorkspacePython,
+    ProjectEnvironmentPolicy, ProjectEnvironmentTarget, ProjectInterpreter, ProjectPythonRequest,
+    ScriptInterpreter, UniversalState,
 };
 use crate::commands::reporters::LatestVersionReporter;
 use crate::commands::{ExitStatus, UvError};
@@ -142,7 +142,7 @@ pub(crate) async fn tree(
             .await?
             .into_interpreter(),
             TreeSource::Manifest(LockTarget::Workspace(workspace)) => {
-                let workspace_python = WorkspacePython::from_request(
+                let project_python = ProjectPythonRequest::from_request(
                     python.as_deref().map(PythonRequest::parse),
                     Some(workspace),
                     &groups,
@@ -152,8 +152,7 @@ pub(crate) async fn tree(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::from(workspace),
-                    &groups,
-                    workspace_python,
+                    project_python,
                     client_builder,
                     python_preference,
                     python_downloads,
@@ -174,7 +173,7 @@ pub(crate) async fn tree(
                 } else {
                     root
                 };
-                let workspace_python = WorkspacePython::from_lockfile(
+                let project_python = ProjectPythonRequest::from_lockfile(
                     python.as_deref().map(PythonRequest::parse),
                     InstallTarget::Lockfile {
                         root,
@@ -189,8 +188,7 @@ pub(crate) async fn tree(
                 .await?;
                 ProjectInterpreter::discover(
                     ProjectEnvironmentTarget::Lockfile { root, lock },
-                    &groups,
-                    workspace_python,
+                    project_python,
                     client_builder,
                     python_preference,
                     python_downloads,
